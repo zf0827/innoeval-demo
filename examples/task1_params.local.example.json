@@ -1,0 +1,4 @@
+{
+  "embedding_model_path": "/absolute/path/to/your/bge-large-en-v1.5",
+  "reranker_model_path": "/absolute/path/to/your/bge-reranker-large"
+}
