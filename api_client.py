@@ -54,6 +54,7 @@ class KG2ApiClient:
         self._client = httpx.Client(
             base_url=settings.base_url,
             timeout=settings.timeout,
+            trust_env=False,
             headers={
                 "Content-Type": "application/json",
                 "X-API-Key": settings.api_key,
@@ -98,30 +99,37 @@ class KG2ApiClient:
             raise KG2ApiError(f"KG2API {path} returned a non-object response", payload=body)
         return body
 
-    def search(self, *, idea_text: str | None = None, pdf_path: str | None = None, options: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if normalize_whitespace(idea_text):
-            payload["idea_text"] = idea_text
-        if normalize_whitespace(pdf_path):
-            payload["pdf_path"] = pdf_path
+    def search(self, *, plan: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "plan": plan,
+        }
         if options:
             payload["options"] = options
         return self._request("/v1/search", payload)
 
-    def authors_related(self, *, idea_text: str | None = None, pdf_path: str | None = None, options: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if normalize_whitespace(idea_text):
-            payload["idea_text"] = idea_text
-        if normalize_whitespace(pdf_path):
-            payload["pdf_path"] = pdf_path
+    def authors_related(self, *, plan: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "plan": plan,
+        }
         if options:
             payload["options"] = options
         return self._request("/v1/authors/related", payload)
 
+    @staticmethod
+    def _author_reference_payload(author: dict[str, Any]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        author_id = normalize_whitespace(author.get("author_id"))
+        name = normalize_whitespace(author.get("name"))
+        if author_id:
+            payload["author_id"] = author_id
+        if name:
+            payload["name"] = name
+        return payload
+
     def authors_support_papers(self, *, query_text: str, authors: list[dict[str, Any]], options: dict[str, Any] | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "query_text": query_text,
-            "authors": authors,
+            "authors": [self._author_reference_payload(author) for author in authors],
         }
         if options:
             payload["options"] = options

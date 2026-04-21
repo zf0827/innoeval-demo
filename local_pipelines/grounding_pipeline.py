@@ -304,6 +304,55 @@ class AtomicQuery:
         }
 
 
+def build_fallback_queries_from_extraction(
+    extraction: StructuredExtraction,
+    *,
+    max_queries: int,
+    idea_text: str | None = None,
+) -> tuple[list[AtomicQuery], str | None]:
+    candidates: list[tuple[str, str]] = [
+        ("motivation", sentence) for sentence in extraction.motivation
+    ] + [
+        ("method", sentence) for sentence in extraction.method
+    ]
+    reason = "source_sentence_fallback"
+
+    if not candidates:
+        candidates = [("method", sentence) for sentence in extraction.basic_idea]
+        reason = "basic_idea_fallback"
+
+    if not candidates:
+        normalized_idea_text = normalize_whitespace(idea_text)
+        if normalized_idea_text:
+            candidates = [("method", normalized_idea_text)]
+            reason = "idea_text_fallback"
+
+    queries: list[AtomicQuery] = []
+    seen: set[str] = set()
+    for section, sentence in candidates:
+        if len(queries) >= max_queries:
+            break
+        normalized_sentence = normalize_whitespace(sentence)
+        if not normalized_sentence:
+            continue
+        dedupe_key = f"{section}\t{normalized_sentence.casefold()}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        queries.append(
+            AtomicQuery(
+                query_id=f"q{len(queries) + 1}",
+                section=section,
+                sentence=normalized_sentence,
+                query_text=normalized_sentence,
+            )
+        )
+
+    if not queries:
+        return [], None
+    return queries, reason
+
+
 @dataclass(slots=True)
 class ParagraphRecord:
     paragraph_id: str
@@ -403,24 +452,59 @@ class DmxQueryGenerator:
         extraction: StructuredExtraction,
         *,
         max_queries: int,
-    ) -> list[AtomicQuery]:
+        idea_text: str | None = None,
+    ) -> tuple[list[AtomicQuery], dict[str, Any]]:
         payload = {
             "motivation": list(extraction.motivation),
             "method": list(extraction.method),
         }
-        content = self._request_content(
-            system_prompt=QUERY_GENERATION_SYSTEM_PROMPT,
-            user_prompt=QUERY_GENERATION_USER_PROMPT.format(
-                max_queries=max_queries,
-                items_json=json.dumps(payload, ensure_ascii=False, indent=2),
-            ),
-            max_tokens=min(max(self.config.max_tokens, 1000), 1800),
+        fallback_queries, fallback_reason = build_fallback_queries_from_extraction(
+            extraction,
+            max_queries=max_queries,
+            idea_text=idea_text,
         )
-        queries = parse_query_generation_response(content, max_queries=max_queries)
-        filtered = [query for query in queries if query.section in {"motivation", "method"}]
-        if not filtered:
-            raise GroundingError("No usable motivation/method queries found in LLM response.")
-        return filtered[:max_queries]
+
+        if not extraction.motivation and not extraction.method:
+            if fallback_queries:
+                return fallback_queries, {
+                    "strategy": "fallback",
+                    "fallback_used": True,
+                    "fallback_reason": fallback_reason,
+                    "llm_error": "No motivation/method extraction available for query generation.",
+                }
+            raise GroundingError("No usable extraction content available for query generation.")
+
+        llm_error: str | None = None
+        try:
+            content = self._request_content(
+                system_prompt=QUERY_GENERATION_SYSTEM_PROMPT,
+                user_prompt=QUERY_GENERATION_USER_PROMPT.format(
+                    max_queries=max_queries,
+                    items_json=json.dumps(payload, ensure_ascii=False, indent=2),
+                ),
+                max_tokens=min(max(self.config.max_tokens, 1000), 1800),
+            )
+            queries = parse_query_generation_response(content, max_queries=max_queries)
+            filtered = [query for query in queries if query.section in {"motivation", "method"}]
+            if filtered:
+                return filtered[:max_queries], {
+                    "strategy": "llm",
+                    "fallback_used": False,
+                    "fallback_reason": None,
+                    "llm_error": None,
+                }
+            llm_error = "No usable motivation/method queries found in LLM response."
+        except Exception as exc:
+            llm_error = str(exc)
+
+        if fallback_queries:
+            return fallback_queries, {
+                "strategy": "fallback",
+                "fallback_used": True,
+                "fallback_reason": fallback_reason,
+                "llm_error": llm_error,
+            }
+        raise GroundingError(llm_error or "No usable motivation/method queries found in LLM response.")
 
     def refine_grounding_match(
         self,
@@ -1773,8 +1857,20 @@ def generate_queries(
     )
 
     extraction = generator.extract_structure(idea_text)
-    queries = generator.generate_queries_from_extraction(extraction, max_queries=args.max_queries)
-    return queries, extraction, {"status": "ok", "error": None, "extraction": extraction.to_dict()}
+    queries, query_meta = generator.generate_queries_from_extraction(
+        extraction,
+        max_queries=args.max_queries,
+        idea_text=idea_text,
+    )
+    return queries, extraction, {
+        "status": "ok",
+        "error": None,
+        "extraction": extraction.to_dict(),
+        "strategy": query_meta.get("strategy"),
+        "fallback_used": bool(query_meta.get("fallback_used")),
+        "fallback_reason": query_meta.get("fallback_reason"),
+        "llm_error": query_meta.get("llm_error"),
+    }
 
 
 def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
@@ -1983,6 +2079,10 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
             "status": query_generation_meta["status"],
             "error": query_generation_meta["error"],
             "extraction": query_generation_meta["extraction"],
+            "strategy": query_generation_meta.get("strategy"),
+            "fallback_used": bool(query_generation_meta.get("fallback_used")),
+            "fallback_reason": query_generation_meta.get("fallback_reason"),
+            "llm_error": query_generation_meta.get("llm_error"),
             "model": args.query_model,
             "query_count": len(queries),
             "queries": [query.to_dict() for query in queries],

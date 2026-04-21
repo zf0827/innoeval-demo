@@ -10,7 +10,7 @@ DEMO_DIR = Path(__file__).resolve().parent.parent
 if str(DEMO_DIR) not in sys.path:
     sys.path.insert(0, str(DEMO_DIR))
 
-from api_client import load_kg2api_settings
+from api_client import KG2ApiClient, load_kg2api_settings
 from common import truncate_text
 from renderers import render_response_markdown
 from run_demo import build_parser
@@ -29,7 +29,7 @@ class DemoRendererTests(unittest.TestCase):
     def test_merge_task_params_overrides_defaults(self) -> None:
         params = merge_task_params(TASK_TOPIC_TREND_REVIEW, {"final_paper_count_for_summary": 12})
         self.assertEqual(params["final_paper_count_for_summary"], 12)
-        self.assertEqual(params["kg_top_k"], 40)
+        self.assertEqual(params["search_api_top_k"], 40)
 
     def test_truncate_text_shortens_long_text(self) -> None:
         text = "a" * 80
@@ -138,6 +138,51 @@ class DemoRendererTests(unittest.TestCase):
         self.assertIn("Idea A", markdown)
 
 
+class GroundingPipelineTests(unittest.TestCase):
+    def test_build_fallback_queries_uses_basic_idea_when_motivation_and_method_missing(self) -> None:
+        from local_pipelines.grounding_pipeline import (
+            StructuredExtraction,
+            build_fallback_queries_from_extraction,
+        )
+
+        queries, reason = build_fallback_queries_from_extraction(
+            StructuredExtraction(
+                basic_idea=["Use literature-grounded evidence to evaluate research ideas."],
+                motivation=[],
+                method=[],
+                experimental_focus=[],
+            ),
+            max_queries=3,
+        )
+
+        self.assertEqual(reason, "basic_idea_fallback")
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(queries[0].section, "method")
+        self.assertEqual(queries[0].query_text, "Use literature-grounded evidence to evaluate research ideas.")
+
+    def test_build_fallback_queries_uses_idea_text_when_extraction_is_empty(self) -> None:
+        from local_pipelines.grounding_pipeline import (
+            StructuredExtraction,
+            build_fallback_queries_from_extraction,
+        )
+
+        queries, reason = build_fallback_queries_from_extraction(
+            StructuredExtraction(
+                basic_idea=[],
+                motivation=[],
+                method=[],
+                experimental_focus=[],
+            ),
+            max_queries=2,
+            idea_text="Knowledge-grounded evaluation of scientific research ideas",
+        )
+
+        self.assertEqual(reason, "idea_text_fallback")
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(queries[0].section, "method")
+        self.assertEqual(queries[0].query_text, "Knowledge-grounded evaluation of scientific research ideas")
+
+
 class ConfigAndCliTests(unittest.TestCase):
     def test_load_kg2api_settings_reads_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -163,6 +208,39 @@ class ConfigAndCliTests(unittest.TestCase):
         request = DemoRequest(task_type=TASK_RELATED_AUTHORS, input_payload={"idea_text": "idea"})
         self.assertEqual(request.task_type, TASK_RELATED_AUTHORS)
         self.assertEqual(request.input_payload["idea_text"], "idea")
+
+    def test_authors_support_papers_strips_extra_author_fields(self) -> None:
+        client = KG2ApiClient.__new__(KG2ApiClient)
+        captured: dict[str, object] = {}
+
+        def fake_request(path: str, payload: dict[str, object]) -> dict[str, object]:
+            captured["path"] = path
+            captured["payload"] = payload
+            return {"status": "ok"}
+
+        client._request = fake_request  # type: ignore[method-assign]
+
+        client.authors_support_papers(
+            query_text="knowledge-grounded evaluation",
+            authors=[
+                {"author_id": " A1 ", "name": " Alice ", "score": 0.9, "rank": 1},
+                {"name": "Bob", "extra": "ignored"},
+            ],
+            options={"top_k_per_author": 2},
+        )
+
+        self.assertEqual(captured["path"], "/v1/authors/support-papers")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "query_text": "knowledge-grounded evaluation",
+                "authors": [
+                    {"author_id": "A1", "name": "Alice"},
+                    {"name": "Bob"},
+                ],
+                "options": {"top_k_per_author": 2},
+            },
+        )
 
 
 if __name__ == "__main__":

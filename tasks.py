@@ -6,19 +6,17 @@ from typing import Any
 
 from api_client import KG2ApiClient, load_kg2api_settings
 from common import (
-    DEFAULT_LLM_BASE_URL,
-    DEFAULT_LLM_MODEL_NAME,
     dedupe_preserve_order,
     ensure_dir,
-    extract_json_object,
-    first_non_empty,
     get_env_value,
     load_env_values,
     normalize_whitespace,
     truncate_text,
     write_json,
-    write_text,
 )
+from llm_utils import call_llm_json
+from search_planner import build_search_plan
+from search_reranker import rerank_search_payload
 from prompts import (
     IDEA_EVALUATION_SYSTEM_PROMPT,
     IDEA_EVALUATION_USER_PROMPT,
@@ -52,17 +50,10 @@ def _paper_card_from_ranked_item(item: dict[str, Any], *, abstract_char_limit: i
     }
 
 
-def _search_options_from_params(params: dict[str, Any], *, final_top_k: int | None = None) -> dict[str, Any]:
+def _search_options_from_params(params: dict[str, Any], *, top_k: int | None = None) -> dict[str, Any]:
     options: dict[str, Any] = {
-        "kg_top_k": int(params["kg_top_k"]),
-        "s2_top_k": int(params["s2_top_k"]),
-        "disable_llm_ranking": bool(params.get("disable_llm_ranking")),
-        "use_env_proxy": bool(params.get("use_env_proxy")),
+        "top_k": int(top_k if top_k is not None else params.get("search_api_top_k") or params.get("search_final_top_k") or 20),
     }
-    if final_top_k is not None:
-        options["final_top_k"] = int(final_top_k)
-    elif params.get("search_final_top_k") is not None:
-        options["final_top_k"] = int(params["search_final_top_k"])
     for key in ("target_field", "after", "before"):
         value = params.get(key)
         if value is not None and normalize_whitespace(value):
@@ -70,23 +61,49 @@ def _search_options_from_params(params: dict[str, Any], *, final_top_k: int | No
     return options
 
 
+def _build_search_plan(
+    *,
+    input_payload: dict[str, Any],
+    params: dict[str, Any],
+    env_path: Path,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    text = normalize_whitespace(input_payload.get("idea_text") or input_payload.get("topic_text")) or None
+    pdf_path = normalize_whitespace(input_payload.get("pdf_path")) or None
+    return build_search_plan(
+        text=text,
+        pdf_path=pdf_path,
+        params=params,
+        env_path=env_path,
+        artifact_dir=artifact_dir,
+    )
+
+
 def _run_search_via_api(
     *,
     client: KG2ApiClient,
-    input_payload: dict[str, Any],
+    plan: dict[str, Any],
     params: dict[str, Any],
+    env_path: Path,
     artifact_dir: Path,
-    final_top_k: int | None = None,
+    api_top_k: int | None = None,
+    rerank_top_k: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], Path]:
     ensure_dir(artifact_dir)
     response = client.search(
-        idea_text=normalize_whitespace(input_payload.get("idea_text")) or None,
-        pdf_path=normalize_whitespace(input_payload.get("pdf_path")) or None,
-        options=_search_options_from_params(params, final_top_k=final_top_k),
+        plan=plan,
+        options=_search_options_from_params(params, top_k=api_top_k),
     )
     response_path = artifact_dir / "api_response.json"
     write_json(response_path, response)
     payload = response.get("result", {}) if isinstance(response.get("result"), dict) else {}
+    payload = rerank_search_payload(
+        search_payload=payload,
+        plan=plan,
+        env_path=env_path,
+        params=params,
+        final_top_k=rerank_top_k,
+    )
     result_path = artifact_dir / "result.json"
     write_json(result_path, payload)
     return response, payload, result_path
@@ -207,64 +224,13 @@ def _run_grounding(
 
 
 def _resolve_query_text(search_payload: dict[str, Any]) -> str:
-    idea_text = normalize_whitespace(search_payload.get("idea_text"))
-    if idea_text:
-        return idea_text
-
-    s2_payload = search_payload.get("sources", {}).get("s2", {})
-    if isinstance(s2_payload, dict):
-        pdf_payload = s2_payload.get("pdf", {})
-        if isinstance(pdf_payload, dict):
-            return normalize_whitespace(pdf_payload.get("abstract")) or normalize_whitespace(pdf_payload.get("title"))
+    query_text = normalize_whitespace(search_payload.get("query_text"))
+    if query_text:
+        return query_text
+    plan = search_payload.get("plan")
+    if isinstance(plan, dict):
+        return normalize_whitespace(plan.get("query_text"))
     return ""
-
-
-def _load_llm_client(env_path: Path, params: dict[str, Any]) -> tuple[Any, str]:
-    from openai import OpenAI
-
-    env_values = load_env_values(env_path)
-    api_key = first_non_empty(
-        params.get("llm_api_key"),
-        get_env_value(env_values, "OPENAI_API_KEY", "DMX-API-KEY", "DMX_API_KEY"),
-    )
-    if not api_key:
-        raise ValueError(f"Missing LLM API key in {env_path}")
-    base_url = first_non_empty(
-        params.get("llm_base_url"),
-        get_env_value(env_values, "OPENAI_BASE_URL"),
-        DEFAULT_LLM_BASE_URL,
-    )
-    model_name = first_non_empty(
-        params.get("llm_model_name"),
-        params.get("llm_model"),
-        get_env_value(env_values, "OPENAI_MODEL", "SEARCH_LLM_MODEL"),
-        DEFAULT_LLM_MODEL_NAME,
-    )
-    return OpenAI(api_key=api_key, base_url=base_url), model_name
-
-
-def _call_llm_json(
-    *,
-    env_path: Path,
-    params: dict[str, Any],
-    system_prompt: str,
-    user_prompt: str,
-    artifact_path: Path | None = None,
-) -> dict[str, Any]:
-    client, model_name = _load_llm_client(env_path, params)
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        response_format={"type": "json_object"},
-    )
-    content = response.choices[0].message.content or "{}"
-    if artifact_path is not None:
-        write_text(artifact_path, content)
-    return extract_json_object(content)
 
 
 def _aggregate_grounding_matches(
@@ -352,7 +318,7 @@ def _run_idea_evaluation(
 ) -> tuple[dict[str, Any], Path]:
     top_matches, per_paper = _aggregate_grounding_matches(grounding_payload)
     grounding_context = _build_grounding_context_for_evaluation(top_matches, per_paper)
-    result = _call_llm_json(
+    result = call_llm_json(
         env_path=env_path,
         params=params,
         system_prompt=IDEA_EVALUATION_SYSTEM_PROMPT,
@@ -585,11 +551,21 @@ def _build_supporting_papers(authors: list[dict[str, Any]]) -> list[dict[str, An
 def _execute_grounding_compare(request: DemoRequest, run_dir: Path, client: KG2ApiClient) -> dict[str, Any]:
     params = merge_task_params(request.task_type, request.params)
     artifact_root = ensure_dir(run_dir / "artifacts")
-    _, search_payload, search_result_path = _run_search_via_api(
-        client=client,
+    search_artifact_dir = ensure_dir(artifact_root / "search")
+    plan = _build_search_plan(
         input_payload=request.input_payload,
         params=params,
-        artifact_dir=artifact_root / "search",
+        env_path=request.env_path,
+        artifact_dir=search_artifact_dir,
+    )
+    _, search_payload, search_result_path = _run_search_via_api(
+        client=client,
+        plan=plan,
+        params=params,
+        env_path=request.env_path,
+        artifact_dir=search_artifact_dir,
+        api_top_k=int(params["search_api_top_k"]),
+        rerank_top_k=int(params["search_final_top_k"]),
     )
     _, manifest_path = _run_manifest(
         search_result_path=search_result_path,
@@ -617,7 +593,7 @@ def _execute_grounding_compare(request: DemoRequest, run_dir: Path, client: KG2A
         all_sp.extend(pdata["similar_points"])
         all_dp.extend(pdata["different_points"])
 
-    idea_text = normalize_whitespace(request.input_payload.get("idea_text") or search_payload.get("idea_text") or "")
+    idea_text = normalize_whitespace(request.input_payload.get("idea_text") or _resolve_query_text(search_payload))
     evaluation_artifact_dir = ensure_dir(artifact_root / "idea_evaluation")
     idea_evaluation, evaluation_artifact_path = _run_idea_evaluation(
         idea_text=idea_text,
@@ -659,12 +635,21 @@ def _execute_topic_trend_review(request: DemoRequest, run_dir: Path, client: KG2
     if not topic_text:
         raise ValueError("Task 2 requires topic_text.")
 
-    _, search_payload, search_result_path = _run_search_via_api(
-        client=client,
+    search_artifact_dir = ensure_dir(run_dir / "artifacts" / "search")
+    plan = _build_search_plan(
         input_payload={"idea_text": topic_text},
         params=params,
-        artifact_dir=ensure_dir(run_dir / "artifacts" / "search"),
-        final_top_k=int(params["final_paper_count_for_summary"]),
+        env_path=request.env_path,
+        artifact_dir=search_artifact_dir,
+    )
+    _, search_payload, search_result_path = _run_search_via_api(
+        client=client,
+        plan=plan,
+        params=params,
+        env_path=request.env_path,
+        artifact_dir=search_artifact_dir,
+        api_top_k=int(params["search_api_top_k"]),
+        rerank_top_k=int(params["final_paper_count_for_summary"]),
     )
 
     ranked_papers = [
@@ -677,7 +662,7 @@ def _execute_topic_trend_review(request: DemoRequest, run_dir: Path, client: KG2
         key=lambda item: (item.get("year") is None, item.get("year") or 9999, item.get("title") or ""),
     )
     llm_artifact_path = run_dir / "artifacts" / "trend_review.raw.json"
-    trend_summary = _call_llm_json(
+    trend_summary = call_llm_json(
         env_path=request.env_path,
         params=params,
         system_prompt="You analyze academic topic evolution and only return valid JSON objects.",
@@ -708,13 +693,18 @@ def _execute_topic_trend_review(request: DemoRequest, run_dir: Path, client: KG2
 def _execute_related_authors(request: DemoRequest, run_dir: Path, client: KG2ApiClient) -> dict[str, Any]:
     params = merge_task_params(request.task_type, request.params)
     artifacts = ensure_dir(run_dir / "artifacts")
+    plan_artifact_dir = ensure_dir(artifacts / "query_plan")
+    plan = _build_search_plan(
+        input_payload=request.input_payload,
+        params=params,
+        env_path=request.env_path,
+        artifact_dir=plan_artifact_dir,
+    )
 
     authors_response = client.authors_related(
-        idea_text=normalize_whitespace(request.input_payload.get("idea_text")) or None,
-        pdf_path=normalize_whitespace(request.input_payload.get("pdf_path")) or None,
+        plan=plan,
         options={
             "top_k": int(params["author_top_k"]),
-            "use_env_proxy": bool(params.get("use_env_proxy")),
             **{
                 key: params[key]
                 for key in ("target_field", "after", "before")
@@ -726,28 +716,7 @@ def _execute_related_authors(request: DemoRequest, run_dir: Path, client: KG2Api
     authors_result = authors_response.get("result", {}) if isinstance(authors_response.get("result"), dict) else {}
     authors = [dict(item) for item in authors_result.get("authors", []) if isinstance(item, dict)]
     authors = authors[: int(params["author_top_k"])]
-    query_text = normalize_whitespace(authors_result.get("resolved_query_text")) or normalize_whitespace(request.input_payload.get("idea_text"))
-    search_result_path: Path | None = None
-
-    if (not authors or not query_text) and params.get("search_fallback_for_query", True):
-        _, search_payload, search_result_path = _run_search_via_api(
-            client=client,
-            input_payload=request.input_payload,
-            params={
-                **params,
-                "kg_top_k": max(int(params["author_top_k"]), int(params.get("kg_top_k") or params["author_top_k"])),
-                "s2_top_k": int(params.get("s2_top_k") or max(int(params["author_top_k"]), 20)),
-                "search_final_top_k": int(params.get("search_final_top_k") or 20),
-                "disable_llm_ranking": True,
-            },
-            artifact_dir=artifacts / "search_fallback",
-        )
-        if not authors:
-            raw_authors = search_payload.get("sources", {}).get("kg", {}).get("authors", [])
-            if isinstance(raw_authors, list):
-                authors = [dict(item) for item in raw_authors[: int(params["author_top_k"])] if isinstance(item, dict)]
-        if not query_text:
-            query_text = _resolve_query_text(search_payload)
+    query_text = normalize_whitespace(authors_result.get("resolved_query_text")) or normalize_whitespace(plan.get("query_text"))
 
     support_response_path: Path | None = None
     if authors and query_text:
@@ -783,9 +752,9 @@ def _execute_related_authors(request: DemoRequest, run_dir: Path, client: KG2Api
         if authors
         else "No related authors were returned."
     )
-    artifact_payload = {}
-    if search_result_path is not None:
-        artifact_payload["search_result_path"] = str(search_result_path.resolve())
+    artifact_payload = {
+        "query_plan_path": str((plan_artifact_dir / "plan.json").resolve()),
+    }
     if support_response_path is not None:
         artifact_payload["authors_support_papers_response_path"] = str(support_response_path.resolve())
 
@@ -848,7 +817,7 @@ def _execute_author_profile(request: DemoRequest, run_dir: Path, client: KG2ApiC
     raw_papers_path = artifact_root / "selected_papers.json"
     write_json(raw_papers_path, {"author_name": author_name, "papers": selected_papers})
     llm_raw_path = artifact_root / "author_profile.raw.json"
-    summary_payload = _call_llm_json(
+    summary_payload = call_llm_json(
         env_path=request.env_path,
         params=params,
         system_prompt="You summarize an author's research trajectory and only return valid JSON objects.",
@@ -887,11 +856,21 @@ def _execute_idea_generation(request: DemoRequest, run_dir: Path, client: KG2Api
     if not topic_text:
         raise ValueError("Task 5 requires topic_text or idea_text.")
 
-    _, search_payload, search_result_path = _run_search_via_api(
-        client=client,
+    search_artifact_dir = ensure_dir(run_dir / "artifacts" / "search")
+    plan = _build_search_plan(
         input_payload={"idea_text": topic_text},
         params=params,
-        artifact_dir=ensure_dir(run_dir / "artifacts" / "search"),
+        env_path=request.env_path,
+        artifact_dir=search_artifact_dir,
+    )
+    _, search_payload, search_result_path = _run_search_via_api(
+        client=client,
+        plan=plan,
+        params=params,
+        env_path=request.env_path,
+        artifact_dir=search_artifact_dir,
+        api_top_k=int(params["search_api_top_k"]),
+        rerank_top_k=int(params["final_paper_count_for_summary"]),
     )
 
     ranked_papers = [
@@ -900,7 +879,7 @@ def _execute_idea_generation(request: DemoRequest, run_dir: Path, client: KG2Api
         if isinstance(item, dict)
     ]
     llm_artifact_path = run_dir / "artifacts" / "idea_generation.raw.json"
-    raw_ideas = _call_llm_json(
+    raw_ideas = call_llm_json(
         env_path=request.env_path,
         params=params,
         system_prompt="You are an expert research idea generator and only return valid JSON.",
